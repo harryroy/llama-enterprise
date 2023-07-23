@@ -1,6 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
-
+# Import necessary libraries and modules
 import json
 import os
 import sys
@@ -22,25 +20,30 @@ from llama.tokenizer import Tokenizer
 Role = Literal["system", "user", "assistant"]
 
 
+# Define the structure of a message in a conversation
 class Message(TypedDict):
     role: Role
     content: str
 
 
+# Define the structure of a completion prediction for generating responses
 class CompletionPrediction(TypedDict, total=False):
     generation: str
     tokens: List[str]  # not required
     logprobs: List[float]  # not required
 
 
+# Define the structure of a chat prediction for generating dialogues
 class ChatPrediction(TypedDict, total=False):
     generation: Message
     tokens: List[str]  # not required
     logprobs: List[float]  # not required
 
 
+# Define the structure of a dialogue, which is a list of messages
 Dialog = List[Message]
 
+# Constants for marking the beginning and end of instructions in a message
 B_INST, E_INST = "[INST]", "[/INST]"
 B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 DEFAULT_SYSTEM_PROMPT = """\
@@ -49,6 +52,7 @@ You are a helpful, respectful and honest assistant. Always answer as helpfully a
 If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."""
 
 
+# Main class representing the Llama conversational AI model
 class Llama:
     @staticmethod
     def build(
@@ -58,8 +62,11 @@ class Llama:
         max_batch_size: int,
         model_parallel_size: Optional[int] = None,
     ) -> "Llama":
+        # Initialize distributed training if not already initialized
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group("nccl")
+        
+        # Initialize model parallelism if not already initialized
         if not model_parallel_is_initialized():
             if model_parallel_size is None:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -68,7 +75,7 @@ class Llama:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
 
-        # seed must be the same in all processes
+        # Seed must be the same in all processes for reproducibility
         torch.manual_seed(1)
 
         if local_rank > 0:
@@ -85,6 +92,7 @@ class Llama:
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
 
+        # Create model arguments
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
@@ -117,6 +125,7 @@ class Llama:
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        # Determine the minimum and maximum length of the prompts
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
         assert max_prompt_len <= params.max_seq_len
@@ -133,8 +142,10 @@ class Llama:
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         for cur_pos in range(min_prompt_len, total_len):
+            # Generate logits from the model for the current token position
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if logprobs:
+                # Calculate token log-probabilities for the current position
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
                     target=tokens[:, prev_pos + 1 : cur_pos + 1],
@@ -142,13 +153,16 @@ class Llama:
                     ignore_index=pad_id,
                 )
             if temperature > 0:
+                # Apply temperature to logits for controlled randomness in sampling
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                # Sample the next token from the top-p distribution
                 next_token = sample_top_p(probs, top_p)
             else:
+                # Choose the token with the highest probability as the next token
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
             next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
+            # Only replace token if prompt has already been generated
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
@@ -164,13 +178,13 @@ class Llama:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []
         for i, toks in enumerate(tokens.tolist()):
-            # cut to max gen len
+            # Cut to max gen len
             start = 0 if echo else len(prompt_tokens[i])
             toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
             probs = None
             if logprobs:
                 probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
-            # cut to eos tok if any
+            # Cut to eos token if any
             if self.tokenizer.eos_id in toks:
                 eos_idx = toks.index(self.tokenizer.eos_id)
                 toks = toks[:eos_idx]
@@ -293,6 +307,7 @@ class Llama:
         ]
 
 
+# Helper function for sampling from the top-p distribution
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
