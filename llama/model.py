@@ -1,6 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
-
+# Import necessary libraries and modules
 import math
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
@@ -16,6 +14,7 @@ from fairscale.nn.model_parallel.layers import (
 from torch import nn
 
 
+# Define dataclass to hold model parameters
 @dataclass
 class ModelArgs:
     dim: int = 4096
@@ -31,28 +30,37 @@ class ModelArgs:
     max_seq_len: int = 2048
 
 
+# Root Mean Square Layer Normalization module
 class RMSNorm(torch.nn.Module):
+    # Initialize the module with dimension 'dim' and a small epsilon 'eps'
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    # RMS normalization operation
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    # Forward pass through the RMSNorm module
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
 
+# Function to precompute frequencies in the complex plane
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    # Compute frequencies using the formula 1/(theta^(i/dim)) for i=0 to dim/2
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
+    # Create a grid of frequencies with respect to 'end' and 'freqs'
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    # Convert the frequencies to complex numbers in the polar form
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
 
+# Function to reshape the broadcasted frequencies for applying rotary embeddings
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
@@ -61,19 +69,24 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
+# Function to apply rotary embeddings to input tensors
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Convert the input tensors to complex form
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # Reshape and broadcast the frequencies for applying rotary embeddings
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    # Apply the rotary embeddings to the input tensors and convert back to real form
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
+# Function to repeat keys and values for multi-head attention mechanism
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -86,6 +99,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+# Attention module used in the TransformerBlock
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -142,6 +156,7 @@ class Attention(nn.Module):
             )
         ).cuda()
 
+    # Forward pass of the attention module
     def forward(
         self,
         x: torch.Tensor,
@@ -156,33 +171,40 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
+        # Apply rotary embeddings to queries and keys
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
+        # Cache the keys and values for efficient reuse in subsequent attention blocks
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
-        # repeat k/v heads if n_kv_heads < n_heads
+        # Repeat keys and values if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
+
+        # Compute scaled dot-product attention scores
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        # Compute the output of the attention module
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 
+# Feed Forward module used in the TransformerBlock
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -208,10 +230,12 @@ class FeedForward(nn.Module):
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
+    # Forward pass of the feed forward module
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+# TransformerBlock module
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -229,6 +253,7 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
+    # Forward pass of the TransformerBlock module
     def forward(
         self,
         x: torch.Tensor,
@@ -243,6 +268,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
+# Transformer module
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
@@ -250,23 +276,30 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # Token embeddings layer
         self.tok_embeddings = ParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
         )
 
+        # List of TransformerBlock layers
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
+        # Layer normalization for the final output
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+
+        # Output layer
         self.output = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
+        # Precompute frequencies in the complex plane for rotary embeddings
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
+    # Forward pass of the Transformer module
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
